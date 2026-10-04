@@ -4,6 +4,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { redactUserPath } from "../../lib/redact";
+import { hardenSecretPath, windowsSecretAclApplies } from "../../lib/windows-secret-acl";
 import type { CatalogWriteAuditEvent } from "./write-audit-contract";
 
 export const CODEX_CATALOG_AUDIT_FILE = "opencodex-catalog-audit.jsonl";
@@ -11,6 +12,7 @@ export const CATALOG_AUDIT_MAX_BYTES = 256 * 1024;
 export const CATALOG_AUDIT_KEEP_RECORDS = 400;
 export const CATALOG_AUDIT_MAX_EVENT_BYTES = 2 * 1024;
 const MAX_HOME_CHARACTERS = 256;
+const AUDIT_ACL_DEADLINE_MS = 1000;
 const WRITERS = new Set([
   "convergence", "retained-sync", "cache-from-catalog", "cache-invalidate",
   "catalog-pull", "catalog-restore", "codex-restore", "sync-cache", "startup-cache",
@@ -39,8 +41,9 @@ function auditLine(event: CatalogWriteAuditEvent): Buffer {
 }
 
 function regularPrivateFile(stat: Stats): boolean {
-  return stat.isFile() && stat.nlink === 1 && (process.platform === "win32"
-    || (stat.uid === process.getuid?.() && (stat.mode & 0o777) === 0o600));
+  // POSIX bits cannot prove NTFS privacy. Windows requires fresh-file ACL hardening.
+  return !windowsSecretAclApplies() && stat.isFile() && stat.nlink === 1
+    && stat.uid === process.getuid?.() && (stat.mode & 0o777) === 0o600;
 }
 
 function sameFile(left: Stats, right: Stats): boolean {
@@ -97,7 +100,8 @@ function writeAll(fd: number, bytes: Buffer, position: number | null): void {
 
 /**
  * Best-effort adapter. Caller MUST hold K, even for a refusal that has no permit.
- * Owners compact the verified descriptor; foreign callers can only append within both caps.
+ * POSIX owners compact the descriptor; foreign callers only append within both caps.
+ * Windows only publishes into fresh owner files after required ACL hardening.
  * This diagnostic has no replay or authorization role. Process death may leave a partial line.
  */
 export function appendCatalogWriteAudit(
@@ -110,6 +114,7 @@ export function appendCatalogWriteAudit(
     const line = auditLine(event);
     if (line.length > CATALOG_AUDIT_MAX_EVENT_BYTES) return "skipped";
     const path = codexCatalogAuditPath(codexHome);
+    const windows = windowsSecretAclApplies();
     let before: Stats | undefined;
     try { before = lstatSync(path); }
     catch (error) {
@@ -120,8 +125,19 @@ export function appendCatalogWriteAudit(
     const flags = constants.O_RDWR | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)
       | (before ? (options.create ? 0 : constants.O_APPEND) : constants.O_CREAT | constants.O_EXCL);
     fd = openSync(path, flags, 0o600);
-    const opened = fstatSync(fd);
-    if (!regularPrivateFile(opened) || (before && !sameFile(before, opened))) return "skipped";
+    let opened = fstatSync(fd);
+    if (windows) {
+      // Existing files have already been refused: no read-only NTFS privacy verifier exists.
+      if (!opened.isFile() || opened.nlink !== 1 || opened.size !== 0
+        || !sameFile(opened, lstatSync(path))) return "skipped";
+      if (!hardenSecretPath(path, { required: true, deadlineMs: AUDIT_ACL_DEADLINE_MS }).ok) return "skipped";
+      const hardened = fstatSync(fd);
+      // ACL changes legitimately move ctime. Retain object identity, then take a fresh baseline.
+      if (!hardened.isFile() || hardened.nlink !== 1 || hardened.size !== 0
+        || opened.dev !== hardened.dev || opened.ino !== hardened.ino
+        || !sameFile(hardened, lstatSync(path))) return "skipped";
+      opened = hardened;
+    } else if (!regularPrivateFile(opened) || (before && !sameFile(before, opened))) return "skipped";
     if (!options.create && opened.size + line.length > CATALOG_AUDIT_MAX_BYTES) return "skipped";
     const tail = readTail(fd, opened.size);
     const parsed = completeRecords(tail);

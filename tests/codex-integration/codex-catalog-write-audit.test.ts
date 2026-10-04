@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, symlinkSync } from "node:fs";
 import * as fs from "node:fs";
+import * as secretAcl from "../../src/lib/windows-secret-acl";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { repoRoot } from "../helpers/repo-root";
 import { join } from "node:path";
 
 import {
@@ -97,7 +100,7 @@ describe("catalog write audit (#6529)", () => {
     expect(appendUnderK(event, false)).toBe("skipped");
     expect(existsSync(join(codexHome, CODEX_CATALOG_AUDIT_FILE))).toBe(false);
     expect(appendUnderK(event, true)).toBe("created");
-    expect(appendUnderK(event, false)).toBe("appended");
+    expect(appendUnderK(event, false)).toBe(process.platform === "win32" ? "skipped" : "appended");
     if (process.platform !== "win32") {
       expect(statSync(join(codexHome, CODEX_CATALOG_AUDIT_FILE)).mode & 0o777).toBe(0o600);
     }
@@ -111,8 +114,14 @@ describe("catalog write audit (#6529)", () => {
   test("keeps the newest records once the file passes its budget", () => {
     const filler = `${JSON.stringify({ filler: "x".repeat(200) })}\n`;
     const count = Math.ceil(CATALOG_AUDIT_MAX_BYTES / filler.length) + 10;
-    writeFileSync(join(codexHome, CODEX_CATALOG_AUDIT_FILE), filler.repeat(count), { mode: 0o600 });
-    appendUnderK({ opencodexHome, target: "cache", outcome: "written", intent: "cache", writer: "startup-cache" }, true);
+    const bytes = filler.repeat(count);
+    writeFileSync(join(codexHome, CODEX_CATALOG_AUDIT_FILE), bytes, { mode: 0o600 });
+    const result = appendUnderK({ opencodexHome, target: "cache", outcome: "written", intent: "cache", writer: "startup-cache" }, true);
+    if (process.platform === "win32") {
+      expect(result).toBe("skipped");
+      expect(readFileSync(auditPath(), "utf8")).toBe(bytes);
+      return;
+    }
     const lines = auditLines();
     expect(lines).toHaveLength(CATALOG_AUDIT_KEEP_RECORDS);
     expect(statSync(auditPath()).size).toBeLessThanOrEqual(CATALOG_AUDIT_MAX_BYTES);
@@ -184,6 +193,11 @@ describe("the catalog writer funnel (#6529)", () => {
 describe("bounded audit descriptors and privacy", () => {
   test("400 records is the final cap including the appended event, below the byte cap", () => {
     writeFileSync(auditPath(), '{}\n'.repeat(400), { mode: 0o600 });
+    if (process.platform === "win32") {
+      expect(appendUnderK()).toBe("skipped");
+      expect(readFileSync(auditPath(), "utf8")).toBe('{}\n'.repeat(400));
+      return;
+    }
     expect(appendUnderK()).toBe("appended");
     expect(auditLines()).toHaveLength(400);
     expect(auditLines().at(-1)).toMatchObject({ writer: "convergence" });
@@ -193,6 +207,12 @@ describe("bounded audit descriptors and privacy", () => {
     const line = `${JSON.stringify({ padding: "x".repeat(4000) })}\n`;
     writeFileSync(auditPath(), line.repeat(100), { mode: 0o600 });
     const inode = statSync(auditPath()).ino;
+    if (process.platform === "win32") {
+      expect(appendUnderK()).toBe("skipped");
+      expect(statSync(auditPath()).ino).toBe(inode);
+      expect(readFileSync(auditPath(), "utf8")).toBe(line.repeat(100));
+      return;
+    }
     expect(appendUnderK()).toBe("appended");
     expect(statSync(auditPath()).ino).toBe(inode);
     expect(statSync(auditPath()).size).toBeLessThanOrEqual(256 * 1024);
@@ -203,13 +223,18 @@ describe("bounded audit descriptors and privacy", () => {
   test("oversized unterminated tail and malformed or partial lines retain only complete JSON records", () => {
     for (const bytes of ["x".repeat(1024 * 1024), '{}\ninvalid\n{"kept":true}\n{"partial":']) {
       writeFileSync(auditPath(), bytes, { mode: 0o600 });
+      if (process.platform === "win32") {
+        expect(appendUnderK()).toBe("skipped");
+        expect(readFileSync(auditPath(), "utf8")).toBe(bytes);
+        continue;
+      }
       expect(appendUnderK()).toBe("appended");
       const lines = auditLines();
       expect(lines.at(-1)).toMatchObject({ writer: "convergence" });
       expect(statSync(auditPath()).size).toBeLessThanOrEqual(256 * 1024);
       expect(lines).not.toContainEqual({ partial: true });
     }
-    expect(auditLines()[1]).toEqual({ kept: true });
+    if (process.platform !== "win32") expect(auditLines()[1]).toEqual({ kept: true });
   });
 
   test("fixed named projection excludes arbitrary properties and unknown writer/argv secrets", () => {
@@ -234,7 +259,8 @@ describe("bounded audit descriptors and privacy", () => {
 
   test("accepted production writer categories preserve startup and sync distinctions", () => {
     for (const writer of ["startup-cache", "sync-cache"]) appendUnderK({ ...auditEvent(), writer });
-    expect(auditLines().map(line => line.command)).toEqual(["startup-cache", "sync-cache"]);
+    expect(auditLines().map(line => line.command)).toEqual(process.platform === "win32"
+      ? ["startup-cache"] : ["startup-cache", "sync-cache"]);
   });
 
   test("the serialized event ceiling refuses an oversize event before any file mutation", () => {
@@ -253,9 +279,9 @@ describe("bounded audit descriptors and privacy", () => {
     expect(replaceAs("restore", catalogBytes(native, routed))).toEqual({ kind: "written" });
     rmSync(auditPath(), { recursive: true });
     writeFileSync(auditPath(), '{}\n', { mode: 0o644 });
+    expect(replaceAs("restore", catalogBytes(native))).toEqual({ kind: "written" });
+    expect(readFileSync(auditPath(), "utf8")).toBe('{}\n');
     if (process.platform !== "win32") {
-      expect(replaceAs("restore", catalogBytes(native))).toEqual({ kind: "written" });
-      expect(readFileSync(auditPath(), "utf8")).toBe('{}\n');
       expect(statSync(auditPath()).mode & 0o777).toBe(0o644);
     }
   });
@@ -294,8 +320,14 @@ describe("foreign refusal is K-held append only", () => {
     expect(readFileSync(auditPath(), "utf8").startsWith(original)).toBe(true);
     expect(statSync(auditPath()).ino).toBe(before.ino);
     expect(statSync(auditPath()).mode).toBe(before.mode);
-    expect(auditLines()).toHaveLength(2);
-    expect(auditLines()[1]).toMatchObject({ outcome: "refused", reason: "foreign-owner", writer: "retained-sync" });
+    if (process.platform === "win32") {
+      expect(readFileSync(auditPath(), "utf8")).toBe(original);
+      expect(statSync(auditPath()).ctimeMs).toBe(before.ctimeMs);
+      expect(auditLines()).toHaveLength(1);
+    } else {
+      expect(auditLines()).toHaveLength(2);
+      expect(auditLines()[1]).toMatchObject({ outcome: "refused", reason: "foreign-owner", writer: "retained-sync" });
+    }
   });
 
   test("foreign skips byte cap, record cap, oversized, malformed and partial files without any mutation", () => {
@@ -385,7 +417,7 @@ describe("publication and registration semantics", () => {
     }, { intent: "refresh", writer: "convergence" });
     expect(result.kind).toBe("completed");
     await Promise.all(Array.from({ length: 420 }, () => Promise.resolve().then(() => appendUnderK())));
-    expect(auditLines()).toHaveLength(400);
+    expect(auditLines()).toHaveLength(process.platform === "win32" ? 1 : 400);
     expect(statSync(auditPath()).size).toBeLessThanOrEqual(256 * 1024);
     expect(auditLines().every(line => line.writer === "convergence")).toBe(true);
   });
@@ -396,6 +428,12 @@ test("descriptor observation reads at most 256 KiB plus the boundary byte", () =
   writeFileSync(auditPath(), line.repeat(500), { mode: 0o600 });
   const reads = spyOn(fs, "readSync");
   try {
+    if (process.platform === "win32") {
+      expect(appendUnderK()).toBe("skipped");
+      expect(reads).not.toHaveBeenCalled();
+      expect(readFileSync(auditPath(), "utf8")).toBe(line.repeat(500));
+      return;
+    }
     expect(appendUnderK()).toBe("appended");
     expect(reads.mock.calls.length).toBeGreaterThan(0);
     const total = reads.mock.calls.reduce((sum, call) => sum + Number(call[3]), 0);
@@ -414,6 +452,7 @@ test("read and write IO failures leave actual publication and refusal outcomes u
       expect(replaceAs("restore", content)).toEqual({ kind: "written" });
       expect(readFileSync(catalogPath(), "utf8")).toBe(content);
       expect(readFileSync(auditPath(), "utf8")).toBe('{}\n');
+      if (process.platform === "win32") expect(failure).not.toHaveBeenCalled();
     } finally { failure.mockRestore(); }
   }
   foreignBinding();
@@ -421,6 +460,7 @@ test("read and write IO failures leave actual publication and refusal outcomes u
   try {
     expect(refuseForeign()).toEqual({ kind: "unavailable", reason: "foreign-owner" });
     expect(readFileSync(auditPath(), "utf8")).toBe('{}\n');
+    if (process.platform === "win32") expect(failure).not.toHaveBeenCalled();
   } finally { failure.mockRestore(); }
 });
 
@@ -459,13 +499,146 @@ test("retained sync and convergence each audit their early removal refusal exact
     expect(await commitCodexCatalogCandidate(gathered.candidate, 1000)).toEqual({
       kind: "refused", reason: "unbacked-routed-removal",
     });
-    expect(auditLines()).toHaveLength(2);
-    expect(auditLines()[1]).toMatchObject({ reason: "unbacked-routed-removal", writer: "convergence" });
+    if (process.platform === "win32") {
+      expect(auditLines()).toHaveLength(1);
+      expect(auditLines()[0]).toMatchObject({ reason: "unbacked-routed-removal", writer: "retained-sync" });
+    } else {
+      expect(auditLines()).toHaveLength(2);
+      expect(auditLines()[1]).toMatchObject({ reason: "unbacked-routed-removal", writer: "convergence" });
+    }
   } finally {
     if (oldCodexHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = oldCodexHome;
     invalidateBundledCatalogCache();
     resetCatalogRuntimeStateForTests();
     resetCodexRuntimeResolveCacheForTests();
+  }
+});
+
+describe("Windows audit privacy (r4176128642)", () => {
+  let platform: ReturnType<typeof spyOn<typeof secretAcl, "windowsSecretAclApplies">>;
+  let harden: ReturnType<typeof spyOn<typeof secretAcl, "hardenSecretPath">>;
+  beforeEach(() => {
+    platform = spyOn(secretAcl, "windowsSecretAclApplies").mockReturnValue(true);
+    harden = spyOn(secretAcl, "hardenSecretPath").mockReturnValue({ ok: true });
+  });
+  afterEach(() => { harden.mockRestore(); platform.mockRestore(); });
+
+  test("fresh blank owner file is hardened before bytes, accepting legitimate ACL ctime changes", () => {
+    let hardened = false;
+    const realFstat = fs.fstatSync;
+    const realLstat = fs.lstatSync;
+    // Deterministic ACL metadata transition; no dependency on filesystem clock resolution.
+    const postAcl = (stat: fs.Stats) => Object.assign(Object.create(Object.getPrototypeOf(stat)), stat,
+      { ctimeMs: stat.ctimeMs + (hardened ? 1 : 0) }) as fs.Stats;
+    const fstat = spyOn(fs, "fstatSync").mockImplementation(fd => postAcl(realFstat(fd)));
+    const lstat = spyOn(fs, "lstatSync").mockImplementation(path =>
+      path === auditPath() ? postAcl(realLstat(path)) : realLstat(path));
+    const write = spyOn(fs, "writeSync");
+    const open = spyOn(fs, "openSync");
+    harden.mockImplementation((path, options) => {
+      expect(path).toBe(auditPath());
+      expect(readFileSync(path)).toHaveLength(0);
+      expect(write).not.toHaveBeenCalled();
+      expect(options).toEqual({ required: true, deadlineMs: 1000 });
+      hardened = true;
+      return { ok: true };
+    });
+    try {
+      expect(appendUnderK()).toBe("created");
+      expect(harden).toHaveBeenCalledTimes(1);
+      expect(write).toHaveBeenCalled();
+      const creation = open.mock.calls.find(call => call[0] === auditPath());
+      expect(Number(creation![1]) & fs.constants.O_EXCL).toBe(fs.constants.O_EXCL);
+      expect(auditLines()).toEqual([expect.objectContaining({ writer: "convergence" })]);
+    } finally { fstat.mockRestore(); lstat.mockRestore(); write.mockRestore(); open.mockRestore(); }
+  });
+
+  for (const code of ["EICACLS", "ETIMEDOUT", "returned-failure"]) {
+    test(`${code} leaves a blank file and preserves catalog publication`, () => {
+      harden.mockImplementation(path => {
+        expect(readFileSync(path)).toHaveLength(0);
+        if (code === "returned-failure") return { ok: false };
+        throw Object.assign(new Error("ACL failure"), { code });
+      });
+      expect(appendUnderK()).toBe("skipped");
+      expect(harden).toHaveBeenCalledTimes(1);
+      expect(readFileSync(auditPath())).toHaveLength(0);
+      // A skipped diagnostic must not alter the real operation's outcome.
+      expect(replaceAs("restore", catalogBytes(native))).toEqual({ kind: "written" });
+      expect(readFileSync(catalogPath(), "utf8")).toBe(catalogBytes(native));
+      expect(readFileSync(auditPath())).toHaveLength(0);
+      expect(harden).toHaveBeenCalledTimes(1);
+    });
+  }
+
+  test("Windows audit stops after its first event in-process and after a fresh process", () => {
+    expect(appendUnderK()).toBe("created");
+    const before = readFileSync(auditPath(), "utf8");
+    expect(auditLines()).toHaveLength(1);
+    expect(appendUnderK()).toBe("skipped");
+    expect(harden).toHaveBeenCalledTimes(1);
+    const child = spawnSync(process.execPath, ["--eval", `
+      const {spyOn}=require("bun:test");
+      const acl=require("./src/lib/windows-secret-acl");
+      spyOn(acl,"windowsSecretAclApplies").mockReturnValue(true);
+      let hardens=0;
+      spyOn(acl,"hardenSecretPath").mockImplementation(()=>{hardens++;throw new Error("unexpected mutation");});
+      const audit=require("./src/codex/catalog/write-audit");
+      const {withCatalogWriteSerialization}=require("./src/codex/catalog-write-serialization");
+      const outcome=withCatalogWriteSerialization(process.env.CODEX_HOME,()=>audit.appendCatalogWriteAudit(
+        process.env.CODEX_HOME,{opencodexHome:process.env.OPENCODEX_HOME,target:"catalog",outcome:"written",intent:"refresh",writer:"convergence"},{create:true}),
+        {intent:"refresh",writer:"convergence"});
+      console.log(JSON.stringify({outcome,hardens}));
+    `], { cwd: repoRoot(), env: { ...process.env, CODEX_HOME: codexHome, OPENCODEX_HOME: opencodexHome },
+      encoding: "utf8", timeout: 15_000 });
+    expect(child.status, child.stderr).toBe(0);
+    expect(JSON.parse(child.stdout.trim().split("\n").at(-1)!)).toEqual({
+      outcome: { kind: "completed", value: "skipped" }, hardens: 0,
+    });
+    expect(readFileSync(auditPath(), "utf8")).toBe(before);
+  });
+
+  test("existing owner and foreign files skip without even opening or mutating ACLs", () => {
+    const bytes = '{}\n';
+    writeFileSync(auditPath(), bytes, { mode: 0o600 });
+    const before = statSync(auditPath());
+    const open = spyOn(fs, "openSync");
+    try {
+      expect(appendUnderK()).toBe("skipped");
+      expect(appendUnderK(auditEvent(), false)).toBe("skipped");
+      foreignBinding();
+      expect(refuseForeign()).toEqual({ kind: "unavailable", reason: "foreign-owner" });
+      expect(harden).not.toHaveBeenCalled();
+      expect(open.mock.calls.filter(call => call[0] === auditPath())).toEqual([]);
+      expect(readFileSync(auditPath(), "utf8")).toBe(bytes);
+      const after = statSync(auditPath());
+      for (const key of ["dev", "ino", "mode", "size", "mtimeMs", "ctimeMs"] as const) {
+        expect(after[key]).toBe(before[key]);
+      }
+    } finally { open.mockRestore(); }
+  });
+
+  for (const phase of ["before", "after"] as const) {
+    test(`path replacement ${phase} ACL hardening refuses all diagnostic bytes`, () => {
+      const detached = join(codexHome, "detached-audit");
+      const substitute = () => {
+        fs.renameSync(auditPath(), detached);
+        writeFileSync(auditPath(), "replacement", { mode: 0o600 });
+      };
+      const realOpen = fs.openSync;
+      const open = spyOn(fs, "openSync").mockImplementation((path, flags, mode) => {
+        const fd = realOpen(path, flags, mode);
+        if (phase === "before" && path === auditPath()) substitute();
+        return fd;
+      });
+      harden.mockImplementation(() => { substitute(); return { ok: true }; });
+      try {
+        expect(appendUnderK()).toBe("skipped");
+        expect(harden).toHaveBeenCalledTimes(phase === "before" ? 0 : 1);
+        expect(readFileSync(detached)).toHaveLength(0);
+        expect(readFileSync(auditPath(), "utf8")).toBe("replacement");
+      } finally { open.mockRestore(); }
+    });
   }
 });
