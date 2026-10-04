@@ -37,6 +37,7 @@ import {
   resolveEffectiveUserIdentity,
 } from "../../src/codex/user-identity";
 import { saveConfig } from "../../src/config";
+import { readConfigAdmissionSnapshot } from "../../src/config/diagnostics";
 import { handleManagementAPI } from "../../src/server/management-api";
 import type { OcxConfig } from "../../src/types";
 import { ManagementRequest } from "../helpers/management-auth";
@@ -288,6 +289,42 @@ for (const state of ["enabled", "missing", "unreadable", "salvaged"] as const) {
     expect(readFileSync(path, "utf8")).toBe(catalogWithRoutedArk());
     expect(readFileSync(cachePath, "utf8")).toBe(cacheBytes);
   });
+}
+
+for (const slug of ["fast-chat", "vendor/flash"]) {
+  for (const state of ["saved", "missing", "deleted"] as const) {
+    test(`combo alias ${slug} convergence ${state} config protects exact catalog/cache bytes`, async () => {
+      const path = join(codexHome, "opencodex-catalog.json");
+      const cachePath = join(codexHome, "models_cache.json");
+      const parsed = JSON.parse(sourceCatalog());
+      parsed.models.push({ ...parsed.models[0], slug, owned_by: "combo",
+        description: "Routed via opencodex → combo (combo)." });
+      const catalogBytes = `${JSON.stringify(parsed, null, 2)}\n`;
+      const cacheBytes = `${JSON.stringify({ fetched_at: "2026-01-01T00:00:00Z",
+        client_version: "fixture-cache-version", models: parsed.models }, null, 2)}\n`;
+      writeFileSync(path, catalogBytes);
+      writeFileSync(cachePath, cacheBytes);
+      if (state === "saved") {
+        saveConfig({ ...config(), defaultProvider: "ark", providers: { ark: {
+          adapter: "openai-chat", baseUrl: "https://api.example.test/v1", liveModels: false, models: ["a"],
+        } }, combos: { fast: { alias: slug, targets: [{ provider: "ark", model: "a" }] } } });
+        expect(readConfigAdmissionSnapshot().diagnostics.source).toBe("file");
+      }
+      if (state === "missing") rmSync(join(opencodexHome, "config.json"));
+      const result = await commitCodexCatalogCandidate(await candidate(), 1_000);
+      if (state === "deleted") {
+        expect(result.kind).toBe("committed");
+        for (const target of [path, cachePath]) {
+          expect(JSON.parse(readFileSync(target, "utf8")).models.some((row: { slug: string }) => row.slug === slug))
+            .toBe(false);
+        }
+      } else {
+        expect(result).toEqual({ kind: "refused", reason: "unbacked-routed-removal" });
+        expect(readFileSync(path, "utf8")).toBe(catalogBytes);
+        expect(readFileSync(cachePath, "utf8")).toBe(cacheBytes);
+      }
+    });
+  }
 }
 
 test("a commit drops a provider's routed rows once config.json agrees it is gone (#6529)", async () => {

@@ -377,8 +377,10 @@ to snapshot persistence instead of relying on the progress argument alone.
 
 A refresh removes a provider's OpenCodex-authored routed rows wholesale only when config.json agrees
 the provider is gone (#6529). `src/codex/catalog/routed-removal.ts` lists the namespaces whose rows
-are in the active catalog, missing from the candidate, and not enabled by the driving config (native
-alias rows count as `combo`; foreign and account-bound rows never count). Both catalog writers —
+are in the active catalog, missing from the candidate, and not enabled by the driving config. Native
+aliases and combo-owned rows with the generated description prefix count as `combo`, including bare
+and slashed aliases; ownership alone does not establish authorship. Foreign and trusted account-bound
+rows never count. Both catalog writers —
 retained sync (`ocx start`/`ensure`/`sync`) and the convergence commit (management writes, login,
 auto-refresh) — hold the catalog lock K, then config mutation lock C, from the config.json
 re-read through replacement. A busy C also refuses the retained sync write. When the file is

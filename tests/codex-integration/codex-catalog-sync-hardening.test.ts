@@ -1290,6 +1290,51 @@ describe("Codex catalog sync hardening", () => {
     });
   });
 
+  for (const slug of ["fast-chat", "vendor/flash"]) {
+    for (const state of ["saved", "missing", "deleted"] as const) {
+      test(`combo alias ${slug} retained sync ${state} config protects exact catalog/cache bytes`, () => {
+        const catalogPath = join(codexHome, "catalog.json");
+        const cachePath = join(codexHome, "models_cache.json");
+        writeFileSync(join(codexHome, "config.toml"), 'model_catalog_json = "catalog.json"\n');
+        const models = [nativeEntry("gpt-5.5", 0), { ...ocxAuthoredEntry(slug, 5), owned_by: "combo" }];
+        const catalogBytes = `${JSON.stringify({ models }, null, 2)}\n`;
+        const cacheBytes = `${JSON.stringify({ fetched_at: "2026-01-01T00:00:00Z",
+          client_version: "fixture-cache-version", models }, null, 2)}\n`;
+        writeFileSync(catalogPath, catalogBytes);
+        writeFileSync(cachePath, cacheBytes);
+        if (state !== "missing") writeFileSync(join(opencodexHome, "config.json"), JSON.stringify({
+          defaultProvider: "ark", providers: { ark: {
+            adapter: "openai-chat", baseUrl: "https://api.example.test/v1", liveModels: false, models: ["a"],
+          } }, combos: state === "saved"
+            ? { fast: { alias: slug, targets: [{ provider: "ark", model: "a" }] } } : {},
+        }));
+        const r = runScript(codexHome, opencodexHome, `
+          globalThis.fetch = async () => { throw new Error("unexpected fetch"); };
+          const { readConfigAdmissionSnapshot } = require("./src/config/diagnostics");
+          if (${state !== "missing"} && readConfigAdmissionSnapshot().diagnostics.source !== "file") {
+            throw new Error("fixture config must parse without salvage");
+          }
+          const { refreshCodexModelCatalog } = require("./src/codex/refresh");
+          refreshCodexModelCatalog({ providers: {} }).then(res => console.log(JSON.stringify(res)));
+        `, { CODEX_CLI_PATH: createCodexCatalogFixture(opencodexHome) });
+        expect(r.status, r.stderr).toBe(0);
+        const result = JSON.parse(r.stdout.split("\n").at(-1) ?? "{}");
+        if (state === "deleted") {
+          expect(result.catalogWritten).toBe(true);
+          for (const target of [catalogPath, cachePath]) {
+            expect(JSON.parse(readFileSync(target, "utf8")).models.some((row: { slug: string }) => row.slug === slug))
+              .toBe(false);
+          }
+        } else {
+          expect(result.skippedReason).toBe("unbacked_routed_removal");
+          expect(result.cacheSynced).toBe(false);
+          expect(readFileSync(catalogPath, "utf8")).toBe(catalogBytes);
+          expect(readFileSync(cachePath, "utf8")).toBe(cacheBytes);
+        }
+      });
+    }
+  }
+
   test("preserves existing routed entries for providers absent from the current sync config", () => {
     const catalogPath = join(codexHome, "catalog.json");
     writeFileSync(join(codexHome, "config.toml"), 'model_catalog_json = "catalog.json"\n', "utf8");
