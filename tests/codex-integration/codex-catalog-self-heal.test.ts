@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,6 +11,9 @@ import { CATALOG_HEAL_MAX_BYTES, observeCatalogHealFile, selectCatalogHealPath }
 import type { CatalogPublicationEvent } from "../../src/codex/catalog/publication-observer";
 import type { RawCatalog } from "../../src/codex/catalog/parsing";
 import type { OcxConfig } from "../../src/types";
+import { reconcileClientStartupBeforeReady, syncCodexBeforeCatalogObservation } from "../../src/cli/claude-agent-startup-sync";
+import { syncCodexOnStartIfEnabled } from "../../src/codex/desired-state";
+import { createReadinessGate } from "../../src/server/readiness";
 import { tryAdmitTurn } from "../../src/server/lifecycle";
 
 const routed = (slug: string) => ({ slug, description: `Routed via opencodex → ${slug} (owner).` });
@@ -26,11 +29,11 @@ afterEach(() => {
 });
 
 type Heal = NonNullable<CatalogSelfHealDeps["converge"]>;
-function harness(options: { config?: Partial<OcxConfig>; gates?: Partial<CatalogSelfHealGates>; republish?: RawCatalog; realIdle?: boolean } = {}) {
+function harness(options: { path?: string; config?: Partial<OcxConfig>; gates?: Partial<CatalogSelfHealGates>; republish?: RawCatalog; realIdle?: boolean } = {}) {
   let clock = 0;
   let version = 0;
   let catalog: RawCatalog | null = structuredClone(full);
-  let path: string | null = "/codex/opencodex-catalog.json";
+  let path: string | null = options.path ?? "/codex/opencodex-catalog.json";
   let reads = 0;
   let subscriber: ((event: CatalogPublicationEvent) => void) | null = null;
   let timer: (() => void) | null = null;
@@ -453,4 +456,168 @@ describe("bounded catalog healing observations", () => {
     expect(observeCatalogHealFile(link, true)).toBeNull();
     expect(selectCatalogHealPath(link, file, path => path)).toBeNull();
   });
+});
+
+function aliasPaths(kind: "lexical" | "physical" | "case") {
+  const root = temporaryRoot();
+  const home = join(root, "home");
+  mkdirSync(home);
+  const path = join(home, "catalog.json");
+  writeFileSync(path, JSON.stringify(full));
+  if (kind === "physical") {
+    const aliasHome = join(root, "alias");
+    symlinkSync(home, aliasHome, process.platform === "win32" ? "junction" : "dir");
+    return { path, alias: join(aliasHome, "catalog.json") };
+  }
+  return { path, alias: kind === "case" ? path.toUpperCase() : `${home}/./catalog.json` };
+}
+
+for (const kind of ["lexical", "physical", ...(process.platform === "win32" ? ["case" as const] : [])] as const) {
+  for (const release of ["restore", "native-release"] as const) {
+    test(`${kind} alias ${release} during suspended heal fences publication`, async () => {
+      const { path, alias } = aliasPaths(kind);
+      const h = harness({ path });
+      const entered = deferred(), finish = deferred();
+      let publications = 0;
+      h.setHeal(async (_config, lifecycle) => {
+        entered.resolve();
+        await finish.promise;
+        if (!lifecycle.beforeCommit()) return { committed: false };
+        publications++;
+        return { committed: true };
+      });
+      h.rewrite(empty);
+      const tick = h.handle.tickForTests();
+      await entered.promise;
+      h.publish(release === "restore" ? { kind: "published", path: alias, intent: "restore" }
+        : { kind: "native-released", path: alias });
+      finish.resolve();
+      await tick;
+      expect(publications).toBe(0);
+      expect(h.handle.lastHeal()).toBeNull();
+      h.advance(CATALOG_HEAL_WINDOW_MS);
+      await h.handle.tickForTests();
+      expect(h.converges).toHaveLength(1);
+    });
+  }
+  test(`${kind} target alias preserves baseline, observation reuse, and suspended commit`, async () => {
+    const { path, alias } = aliasPaths(kind);
+    const h = harness({ path });
+    h.setPath(alias);
+    await h.handle.tickForTests();
+    expect(h.reads()).toBe(1);
+    h.rewrite(empty);
+    const entered = deferred(), finish = deferred();
+    h.setHeal(async (_config, lifecycle) => {
+      entered.resolve(); await finish.promise;
+      return { committed: lifecycle.beforeCommit() };
+    });
+    const tick = h.handle.tickForTests();
+    await entered.promise;
+    h.setPath(path);
+    finish.resolve();
+    await tick;
+    expect(h.handle.lastHeal()?.committed).toBe(true);
+  });
+  test(`${kind} owner publication accepts the equivalent target`, async () => {
+    const { path, alias } = aliasPaths(kind);
+    const h = harness({ path });
+    h.rewrite(empty);
+    h.publish({ kind: "published", path: alias, intent: "refresh" });
+    await h.handle.tickForTests();
+    expect(h.converges).toHaveLength(0);
+  });
+}
+
+test("unavailable lexical alias restore fences a pending heal", async () => {
+  const h = harness();
+  const entered = deferred(), finish = deferred();
+  let committed = false;
+  h.setHeal(async (_config, lifecycle) => {
+    entered.resolve(); await finish.promise;
+    committed = lifecycle.beforeCommit(); return { committed };
+  });
+  h.rewrite(empty);
+  const tick = h.handle.tickForTests();
+  await entered.promise;
+  h.publish({ kind: "native-released", path: "/codex/./opencodex-catalog.json" });
+  finish.resolve(); await tick;
+  expect(committed).toBe(false);
+});
+
+test.each(["distinct", "hardlink"] as const)("%s restore target remains unrelated", async kind => {
+  const { path } = aliasPaths("lexical");
+  const unrelated = join(temporaryRoot(), "catalog.json");
+  if (kind === "hardlink") linkSync(path, unrelated); else writeFileSync(unrelated, JSON.stringify(full));
+  const h = harness({ path });
+  const entered = deferred(), finish = deferred();
+  let committed = false;
+  h.setHeal(async (_config, lifecycle) => {
+    entered.resolve(); await finish.promise;
+    committed = lifecycle.beforeCommit(); return { committed };
+  });
+  h.rewrite(empty);
+  const tick = h.handle.tickForTests();
+  await entered.promise;
+  h.publish({ kind: "native-released", path: unrelated });
+  finish.resolve(); await tick;
+  expect(committed).toBe(true);
+});
+
+for (const stage of ["Claude", "Desktop"] as const) {
+  test(`startup loss during deferred ${stage} reconciliation is observed after a successful no-op sync`, async () => {
+    const gate = createReadinessGate();
+    const entered = deferred(), finish = deferred();
+    let h: ReturnType<typeof harness> | undefined;
+    const config = { providers: {} } as OcxConfig;
+    const pause = async () => { entered.resolve(); await finish.promise; };
+    const startup = reconcileClientStartupBeforeReady(gate,
+      deferredGate => syncCodexBeforeCatalogObservation(deferredGate,
+        forwarding => syncCodexOnStartIfEnabled(10100, config, async () => ({ ok: true }), forwarding),
+        () => { h = harness(); }),
+      stage === "Claude" ? pause : async () => undefined,
+      stage === "Desktop" ? pause : undefined);
+    try {
+      await entered.promise;
+      expect(gate.getStatus()).toBe("pending");
+      expect(h).toBeDefined();
+      h!.rewrite(empty);
+      await h!.handle.tickForTests();
+      expect(h!.converges).toHaveLength(1);
+    } finally { finish.resolve(); await startup; }
+    expect(gate.getStatus()).toBe("ready");
+  });
+}
+
+test.each(["failed", "thrown"] as const)("%s startup sync never adopts a healer baseline", async kind => {
+  const gate = createReadinessGate();
+  let observations = 0;
+  await reconcileClientStartupBeforeReady(gate,
+    deferredGate => syncCodexBeforeCatalogObservation(deferredGate,
+      forwarding => syncCodexOnStartIfEnabled(10100, { providers: {} } as OcxConfig, async () => {
+        if (kind === "thrown") throw new Error("sync failed");
+        return { ok: false };
+      }, forwarding), () => { observations++; }), async () => undefined);
+  expect(observations).toBe(0);
+  expect(gate.getStatus()).toBe("failed");
+});
+
+test("OFF startup creates gated observation and preserves later enable", async () => {
+  const gate = createReadinessGate();
+  let h: ReturnType<typeof harness> | undefined;
+  const config = { providers: {}, clientIntegrations: { codex: false } } as OcxConfig;
+  const result = await reconcileClientStartupBeforeReady(gate,
+    deferredGate => syncCodexBeforeCatalogObservation(deferredGate,
+      forwarding => syncCodexOnStartIfEnabled(10100, config, async () => { throw new Error("OFF synced"); }, forwarding),
+      () => { h = harness({ config: { clientIntegrations: { codex: false } } }); }), async () => undefined);
+  expect(result.ran).toBe(false);
+  expect(gate.getStatus()).toBe("ready");
+  expect(h).toBeDefined();
+  h!.rewrite(empty);
+  await h!.handle.tickForTests();
+  expect(h!.converges).toHaveLength(0);
+  h!.config.clientIntegrations = { codex: true };
+  h!.advance(CATALOG_HEAL_RECHECK_MS);
+  await h!.handle.tickForTests();
+  expect(h!.converges).toHaveLength(1);
 });

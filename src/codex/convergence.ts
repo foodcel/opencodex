@@ -1,5 +1,6 @@
 import { projectAntigravitySelectedModels } from "../providers/antigravity-effort-families";
 import { join } from "node:path";
+import { sameCatalogHealPath } from "./catalog/heal-observation";
 
 import { getConfigDir, saveConfigPreservingClaudeCode, websocketsEnabled, withExpectedConfigGenerationSync } from "../config";
 import { reconcileSuccessfulModelDiscoveries } from "../providers/new-model-policy";
@@ -39,7 +40,6 @@ import {
   legacyCatalogBackupPath,
   nativeMultiAgentDefaults,
   parseCatalogJson,
-  samePath,
   type RawCatalog,
   type RawEntry,
   } from "./catalog/parsing";
@@ -670,7 +670,7 @@ export async function commitCodexCatalogCandidate(
       const guarded = withExpectedConfigGenerationSync(state.generation, () => {
         const invalid = revalidateCandidate(state);
         if (invalid) return invalid;
-        if (lifecycle.expectedCatalogPath !== undefined && !samePath(state.catalog.path, lifecycle.expectedCatalogPath)) {
+        if (lifecycle.expectedCatalogPath !== undefined && !sameCatalogHealPath(state.catalog.path, lifecycle.expectedCatalogPath)) {
           return { kind: "stale", reason: "target-identity" } as const;
         }
         if (lifecycle.beforeCommit && lifecycle.beforeCommit() !== true) return { kind: "stale", reason: "process-local" } as const;

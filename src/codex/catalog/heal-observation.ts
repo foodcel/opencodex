@@ -1,12 +1,18 @@
-import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, type Stats } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync, type Stats } from "node:fs";
 import { readCodexHomeJournal } from "../codex-home-owner";
-import type { RawCatalog } from "./parsing";
+import { samePath, type RawCatalog } from "./parsing";
 
 export const CATALOG_HEAL_MAX_BYTES = 64 * 1024 * 1024;
 
 export interface CatalogObservation {
   readonly signature: string;
   readonly catalog: RawCatalog | null;
+}
+
+/** Canonical path equality when available; unavailable paths retain lexical equality. */
+export function sameCatalogHealPath(left: string, right: string): boolean {
+  try { return samePath(realpathSync.native(left), realpathSync.native(right)); }
+  catch { return samePath(left, right); }
 }
 
 /** Resolve authority without reading catalog bytes or cleaning journal evidence. */

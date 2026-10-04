@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { armDetachedConfigBaseline, loadConfig, saveConfig } from "../../src/config";
@@ -276,4 +276,15 @@ test("a config restore that compensates emits no native release or catalog publi
   expect(restoreNativeCodex({ skipHistory: true }).artifacts.config.state).toBe("failed");
   expect(compensation).toHaveBeenCalledTimes(1);
   expect(events).toEqual([]);
+});
+
+test("a physically aliased expected catalog target admits the prepared candidate", async () => {
+  const aliasHome = join(root, "alias");
+  symlinkSync(codexHome, aliasHome, process.platform === "win32" ? "junction" : "dir");
+  const run = createManagementConvergeCodex(loadConfig(), {
+    expectedCatalogPath: join(aliasHome, "opencodex-catalog.json"), beforeCommit: () => true,
+  });
+  const outcome = await run(createCatalogConvergeRequest({ deadlineMs: 1_000 }));
+  expect(outcome.catalogRefresh.status).toBe("committed");
+  expect(events).toContainEqual({ kind: "published", path: catalogPath, intent: "refresh" });
 });

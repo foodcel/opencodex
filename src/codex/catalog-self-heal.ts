@@ -3,7 +3,7 @@ import { readRuntimePort } from "../config/process-state";
 import { readClientConnectionState } from "../client/state";
 import { getActiveTurnCount, isDraining, isRecyclingForExit, isShutdownDraining } from "../server/lifecycle";
 import type { OcxConfig } from "../types";
-import { observeCatalogHealFile, selectCatalogHealPath, type CatalogObservation } from "./catalog/heal-observation";
+import { observeCatalogHealFile, sameCatalogHealPath, selectCatalogHealPath, type CatalogObservation } from "./catalog/heal-observation";
 import { subscribeCatalogPublication } from "./catalog/publication-observer";
 import { configEnablesRoutedNamespace, ocxRoutedNamespaceCounts } from "./catalog/routed-removal";
 import { inspectCodexHomeOwner } from "./codex-home-owner";
@@ -138,7 +138,7 @@ export function startCodexCatalogSelfHeal(options: { port?: number; deps?: Catal
   const read = (path: string): NamespaceObservation | null => {
     const quick = observe(path, false);
     if (quick === null) return null;
-    if (observed?.path === path && observed.signature === quick.signature) return observed;
+    if (observed !== null && sameCatalogHealPath(observed.path, path) && observed.signature === quick.signature) return observed;
     const seen = observe(path, true);
     if (seen === null) return null;
     observed = { path, signature: seen.signature, namespaces: seen.catalog ? new Set(ocxRoutedNamespaceCounts(seen.catalog).keys()) : null };
@@ -157,14 +157,15 @@ export function startCodexCatalogSelfHeal(options: { port?: number; deps?: Catal
   const updateTarget = (path: string | null): void => {
     // Unavailable selection is not evidence of a different target or lost authority.
     if (path === null) return;
-    if (target === path) return;
+    if (target !== null && sameCatalogHealPath(target, path)) return;
     clear();
     target = path;
   };
   const beforeCommit = (path: string, entryGeneration: number): boolean => {
     try {
+      const selected = catalogPath();
       return !stopped && !released && generation === entryGeneration
-        && catalogPath() === path && evaluateCatalogSelfHealGates(gates).open;
+        && selected !== null && sameCatalogHealPath(selected, path) && evaluateCatalogSelfHealGates(gates).open;
     } catch { return false; }
   };
   const capRetryAt = (now: number): number => {
@@ -224,7 +225,8 @@ export function startCodexCatalogSelfHeal(options: { port?: number; deps?: Catal
         beforeCommit: () => beforeCommit(path, entryGeneration), expectedCatalogPath: path,
       })).committed; }
       catch { /* Failed attempts retain pending retry and consume the attempt budget. */ }
-      if (stopped || released || generation !== entryGeneration || catalogPath() !== path) return;
+      const selected = catalogPath();
+      if (stopped || released || generation !== entryGeneration || selected === null || !sameCatalogHealPath(selected, path)) return;
       last = { at: new Date().toISOString(), lostNamespaces: lostEnabled.length, committed };
       if (committed) {
         heals.push(clock());
@@ -242,20 +244,21 @@ export function startCodexCatalogSelfHeal(options: { port?: number; deps?: Catal
     // Native restoration can remove the journal before notification. Fence the known
     // target (and target-less releases) without resolving possibly unavailable evidence.
     const release = event.kind === "native-released" || event.intent === "restore";
-    if (release && (event.path === null || event.path === target)) {
+    if (release && (event.path === null || (target !== null && sameCatalogHealPath(event.path, target)))) {
       clear();
       released = true;
       return;
     }
     const path = catalogPath();
-    if (event.path !== null && event.path !== target && event.path !== path) return;
+    if (event.path !== null && (target === null || !sameCatalogHealPath(event.path, target))
+      && (path === null || !sameCatalogHealPath(event.path, path))) return;
     if (release) {
       clear();
       released = true; // Only a later accepted owner publication can re-arm this lifecycle.
       return;
     }
     if (running) return; // Catalog-success/cache-failure must not accept a baseline.
-    if (!evaluateCatalogSelfHealGates(gates).open || event.path !== path) return;
+    if (!evaluateCatalogSelfHealGates(gates).open || event.path === null || path === null || !sameCatalogHealPath(event.path, path)) return;
     updateTarget(path);
     released = false;
     pendingRetry = null;
