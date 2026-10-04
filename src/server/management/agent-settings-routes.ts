@@ -772,11 +772,7 @@ export async function handleAgentSettingsRoutes(ctx: ManagementContext): Promise
     const models = await fetchAllModels(config);
     const disabled = new Set(config.disabledModels ?? []);
     const { listCatalogNativeSlugs } = await import("../../codex/catalog");
-    const visibleRouted = [...new Set(models
-      .filter(m => ![...disabled].some(stored =>
-        stored === catalogModelSlug(m) || slugEquals(stored, m.provider, m.id)
-      ))
-      .map(catalogModelSlug))];
+    const visibleRouted = [...new Set(filterCatalogVisibleModels(models, config).map(catalogModelSlug))];
     const available = [
       ...listCatalogNativeSlugs().filter(ns => !disabled.has(ns)),
       ...visibleRouted,

@@ -1035,7 +1035,7 @@ function buildPiClientConfig(ctx: ExportContext, options: PiExportOptions = {}):
     if (input === null) continue;
     const entry: PiModelEntry = {
       id: model.namespaced,
-      name: exportModelLabel(model),
+      name: model.displayName?.trim() || model.id || model.namespaced,
       input,
     };
     if (Array.isArray(model.reasoningEfforts) && model.reasoningEfforts.length > 0) {

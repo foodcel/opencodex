@@ -495,6 +495,7 @@ export async function listManagementModelRows(
   const knownIds = config.fastRows === false ? new Set<string>() : knownEffortRowIds(config);
   for (const row of rows) knownIds.add(row.namespaced);
   return rows.map(row => {
+    const nativeLabel = row.native ? config.providers.openai?.modelDisplayNames?.[row.id]?.trim() : undefined;
     const pending = initialModelSelectionPending(config.providers[row.provider]);
     const modelCosts = Object.hasOwn(config.providers, row.provider)
       ? config.providers[row.provider]?.modelCosts : undefined;
@@ -517,6 +518,7 @@ export async function listManagementModelRows(
       });
     return {
       ...row,
+      ...(nativeLabel ? { displayName: nativeLabel, displayNameOverride: nativeLabel, displayNameSource: "operator" as const } : {}),
       ...(!row.native && modelCosts !== undefined && Object.hasOwn(modelCosts, row.id)
         ? { manualPricing: true } : {}),
       ...(pending ? { disabled: true, initialSelectionPending: true } : {}),
