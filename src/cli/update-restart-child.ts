@@ -1,12 +1,10 @@
 import { existsSync } from "node:fs";
-import { readClientConnectionState } from "../client/state";
 import { getRuntimePortPath, readRuntimePort } from "../config/process-state";
-import { readConfigDiagnostics } from "../config/diagnostics";
 import { packageVersion } from "../lib/package-version";
 import { parseStrictSemver } from "../lib/strict-semver";
 import { acquireOwnershipMutationLease, OWNERSHIP_MUTATION_LEASE_TOKEN_ENV } from "../service/ownership-mutation-lease.mjs";
 import { serviceStatePaths } from "../service/state";
-import { assertUpdateRestartHome, type UpdateRestartHome } from "./update-restart-home";
+import { assertUpdateRestartConfiguration, assertUpdateRestartHome, type UpdateRestartHome } from "./update-restart-home";
 
 export const UPDATE_RESTART_CHILD_ENV = "OCX_UPDATE_RESTART_CHILD";
 export interface UpdateRestartChildMarker { home: UpdateRestartHome; version: string; port: number; hostname: string; deadlineAt: number }
@@ -57,14 +55,12 @@ export function admitUpdateRestartChild(argv: string[], io: UpdateRestartChildIo
     if (port !== marker.port || bindHost(hostname) !== bindHost(marker.hostname) || (io.version ?? packageVersion)() !== marker.version) throw new Error("update_restart_child_identity_changed");
     (io.checkHome ?? assertUpdateRestartHome)(marker.home);
     (io.checkState ?? (expected => {
-      if (readClientConnectionState().kind !== "disconnected") throw new Error("update_restart_client_refused");
+      assertUpdateRestartConfiguration(expected.hostname);
       const current = readRuntimePort();
       if (existsSync(getRuntimePortPath()) && (!current || current.pid !== process.pid
         || current.port !== expected.port || current.siblingOfPort !== undefined)) {
         throw new Error("update_restart_competing_runtime");
       }
-      const diagnostics = readConfigDiagnostics();
-      if (diagnostics.error || (diagnostics.config.hostname ?? "") !== expected.hostname) throw new Error("update_restart_hostname_changed");
     }))(marker);
   };
   check();

@@ -13,7 +13,7 @@ import { serviceStatePaths } from "../service/state";
 import { findLiveProxy, probeEndpointLiveness, probeHostname, type LiveProxy } from "../server/proxy-liveness";
 import { waitForPortAvailable } from "../server/ports";
 import { UPDATE_RESTART_CHILD_ENV, type UpdateRestartChildMarker } from "./update-restart-child";
-import { assertUpdateRestartHome, readUpdateRestartHome, type UpdateRestartHome } from "./update-restart-home";
+import { assertUpdateRestartConfiguration, assertUpdateRestartHome, readUpdateRestartHome, type UpdateRestartHome } from "./update-restart-home";
 import { observeAttestedUpdateReplacement, stopAttestedUpdateTarget } from "./update-restart-transport";
 import type { UpdateRestartCandidate } from "./update-restart-candidate";
 import { computeVersionSkew } from "./version-skew";
@@ -96,6 +96,7 @@ export async function runUpdateRestart(candidate: UpdateRestartCandidate, deadli
 }
 
 function standalone(target: UpdateRestartCandidate["target"]): boolean {
+  assertUpdateRestartConfiguration(target.hostname ?? "");
   if (process.platform !== "darwin" && process.platform !== "linux") return false;
   const host = probeHostname(target.hostname).replace(/^\[|\]$/g, "");
   if (!isIP(host) || target.source !== "runtime" || target.role === "client" || target.packageTreeFenced) return false;

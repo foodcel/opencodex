@@ -1,4 +1,6 @@
 import { realpathSync, statSync } from "node:fs";
+import { readClientConnectionState } from "../client/state";
+import { readConfigDiagnostics } from "../config/diagnostics";
 import { getConfigDir } from "../config/paths";
 import { currentCodexHome, resolveServiceOwnership, resolveServiceState } from "../service/state";
 
@@ -26,4 +28,11 @@ export function readUpdateRestartHome(): UpdateRestartHome {
 export function assertUpdateRestartHome(expected: UpdateRestartHome): void {
   const current = readUpdateRestartHome();
   if (JSON.stringify(current) !== JSON.stringify(expected)) throw new Error("update_restart_home_changed");
+}
+
+/** Read-only eligibility shared by parent pre-stop and child admission. */
+export function assertUpdateRestartConfiguration(hostname: string): void {
+  const diagnostics = readConfigDiagnostics();
+  if (readClientConnectionState().kind !== "disconnected" || diagnostics.error
+    || (diagnostics.config.hostname ?? "") !== hostname) throw new Error("update_restart_configuration_changed");
 }
