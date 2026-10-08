@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { checkClaudeUsageAdmission } from "../../src/adapters/claude-cli/usage-admission";
 import { buildConversationInput, buildSystemPrompt, mapStreamMessageToEvents, usageFromResult } from "../../src/adapters/coding-agent/protocol";
 import { buildCodeBuddyToolBridge } from "../../src/adapters/codebuddy/tool-bridge";
 import { buildStableClaudeConversationInput, canonicalClaudeJson, CLAUDE_REPLAY_SYSTEM_PROMPT, stableClaudeToolBridge } from "../../src/adapters/claude-cli/stable-replay";
@@ -153,5 +157,40 @@ describe("Anthropic usage normalization", () => {
     expect(state.partialUsage).toMatchObject({ inputTokens: 80, outputTokens: 0, totalTokens: 80 });
     const terminal = mapStreamMessageToEvents({ type: "result", subtype: "success", usage: { input_tokens: 2, output_tokens: 10, cache_read_input_tokens: 50, cache_creation_input_tokens: 100 } }, state);
     expect(terminal.at(-1)).toMatchObject({ type: "done", usage: { inputTokens: 152, totalTokens: 162 } });
+  });
+});
+
+describe("Claude usage admission cache", () => {
+  const identity = () => ({ key: "test-identity", access: "test-access" });
+  const freshQuota = { updatedAt: Date.now(), fiveHourPercent: 10, fiveHourResetAt: Date.now() + 3_600_000, weeklyPercent: 10, weeklyResetAt: Date.now() + 86_400_000 };
+  const seed = (quota: unknown, now: number) => {
+    const dir = mkdtempSync(join(tmpdir(), "ocx-claude-admission-"));
+    const statePath = join(dir, "claude-usage-admission.json");
+    writeFileSync(statePath, JSON.stringify({ identity: "test-identity", checkedAt: now - 10_000, quota }));
+    return { dir, statePath };
+  };
+
+  test("an expired window scoped to another model family does not force a re-read", async () => {
+    const now = Date.now();
+    const { dir, statePath } = seed({ ...freshQuota, customWindows: [{ label: "Opus", percent: 100, resetAt: now - 1000, scope: "model" }] }, now);
+    let probes = 0;
+    const probe = async () => { probes++; return freshQuota; };
+    try {
+      expect((await checkClaudeUsageAdmission("claude-sonnet-5-5", { now: () => now, identity, probe, statePath })).state).toBe("available");
+      expect(probes).toBe(0);
+      expect((await checkClaudeUsageAdmission("claude-opus-5-5", { now: () => now, identity, probe, statePath })).state).toBe("available");
+      expect(probes).toBe(1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test("a cached window above 100% whose reset passed is re-read like one at exactly 100%", async () => {
+    const now = Date.now();
+    const { dir, statePath } = seed({ ...freshQuota, fiveHourPercent: 104, fiveHourResetAt: now - 1000 }, now);
+    let probes = 0;
+    try {
+      const status = await checkClaudeUsageAdmission("claude-sonnet-5-5", { now: () => now, identity, probe: async () => { probes++; return freshQuota; }, statePath });
+      expect(status.state).toBe("available");
+      expect(probes).toBe(1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

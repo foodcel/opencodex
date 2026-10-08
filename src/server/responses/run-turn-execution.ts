@@ -52,7 +52,7 @@ import { planWebSearch } from "../../web-search";
 import { runTurnWebSearchInitialParsed, runTurnWebSearchLoop } from "../../web-search/run-turn-loop";
 import { WEB_SEARCH_TOOL_NAME } from "../../web-search/synthetic-tool";
 import { orderDevinMessagesOutput } from "../../claude/devin-output-order";
-import { checkClaudeUsageAdmission } from "../../adapters/claude-cli/usage-admission";
+import { claudeUsagePreflight } from "../../adapters/claude-cli/usage-admission";
 
 // LOCAL PATCH (runturn-websearch): top-level fields route binding or the
 // adapter itself may write during a turn. Iteration-local `turnParsed` objects
@@ -170,7 +170,14 @@ export async function executeResponsesRunTurn(
   // Publish the known subscription pause before headers or a CLI turn, preserving its reset
   // across both Responses and translated Chat instead of presenting a retryable generic 502.
   if (transportState.runTurnAdapter.name === "claude-cli") {
-    const usage = await checkClaudeUsageAdmission(parsed.modelId);
+    let usage: Awaited<ReturnType<typeof claudeUsagePreflight>>;
+    try {
+      usage = await claudeUsagePreflight(parsed.modelId);
+    } catch (error) {
+      // The outer cleanup does not own the sidecar's probe lease: hand it back before rethrowing.
+      releaseSearchProbeLease();
+      throw error;
+    }
     if (usage.state === "exhausted") {
       cancelResponseCompletion();
       releaseSearchProbeLease();

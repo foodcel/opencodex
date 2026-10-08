@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createClaudeCliAdapter } from "../../src/adapters/claude-cli/adapter";
+import { setClaudeUsagePreflightForTests } from "../../src/adapters/claude-cli/usage-admission";
 import { getAdapterDefinition } from "../../src/adapters/registry";
 import { handleResponses } from "../../src/server/responses";
 import { handleChatCompletions } from "../../src/server/chat-completions";
@@ -18,6 +19,7 @@ test("Codex/DSH Responses and Pi Chat retain host-owned tools, inclusive usage a
   const definition = getAdapterDefinition("claude-cli")! as any;
   const originalCreate = definition.create;
   const releaseSpend = acquireOwnedSpendHome();
+  setClaudeUsagePreflightForTests(async () => ({ state: "available", checkedAt: 0 }));
   const children: number[] = [];
   const ownedChildren: ReturnType<typeof spawn>[] = [];
   const closed = new Set<number>();
@@ -103,8 +105,44 @@ test("Codex/DSH Responses and Pi Chat retain host-owned tools, inclusive usage a
       }
     } finally {
       definition.create = originalCreate;
+      setClaudeUsagePreflightForTests();
       releaseSpend();
       rmSync(home, { recursive: true, force: true });
     }
+  }
+}, 20000);
+
+test("an exhausted Claude subscription is refused before dispatch with 429 and Retry-After; no CLI is spawned", async () => {
+  const definition = getAdapterDefinition("claude-cli")! as any;
+  const originalCreate = definition.create;
+  const releaseSpend = acquireOwnedSpendHome();
+  let spawned = 0;
+  const resetAt = Date.now() + 90_000;
+  setClaudeUsagePreflightForTests(async () => ({ state: "exhausted", checkedAt: Date.now(), resetAt, message: "Claude subscription limits are exhausted." }));
+  definition.create = (provider: any) => createClaudeCliAdapter(provider, {
+    usageAdmission: async () => ({ state: "available" }),
+    usageRefusal: () => {},
+    which: () => process.execPath,
+    spawn: () => { spawned++; throw new Error("the CLI must not start"); },
+  });
+  const config = { port: 0, defaultProvider: "claude-cli", providers: {
+    "claude-cli": { adapter: "claude-cli", baseUrl: "https://api.anthropic.com", authMode: "key", selectedModels: ["claude-sonnet-5-5"] },
+  } } as OcxConfig;
+  const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: req => handleResponses(req, config, { model: "", provider: "" }) });
+  try {
+    const res = await fetch(`http://127.0.0.1:${server.port}/v1/responses`, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "claude-cli/claude-sonnet-5-5", stream: false, input: "hello" }) });
+    const body = await res.json() as any;
+    expect(res.status).toBe(429);
+    expect(body.error.code).toBe("claude_subscription_cooldown");
+    const retryAfter = Number(res.headers.get("retry-after"));
+    expect(retryAfter).toBeGreaterThan(60);
+    expect(retryAfter).toBeLessThanOrEqual(90);
+    expect(spawned).toBe(0);
+  } finally {
+    await server.stop(true);
+    definition.create = originalCreate;
+    setClaudeUsagePreflightForTests();
+    releaseSpend();
   }
 }, 20000);

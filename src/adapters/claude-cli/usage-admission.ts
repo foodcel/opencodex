@@ -69,15 +69,19 @@ function save(path: string, snapshot: Snapshot): void {
   } catch { /* Memory still suppresses launches; no secrets or upstream text are persisted. */ }
 }
 function finite(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value); }
-function admission(snapshot: Snapshot, model: string, now: number): ClaudeAdmission {
-  const quota = snapshot.quota;
+/** Windows that gate this model: the plan windows plus custom windows in scope for its family. */
+function applicableWindows(quota: ProviderQuota | undefined, model: string): { percent?: number; resetAt?: number }[] {
   const family = /opus|sonnet|fable|haiku/i.exec(model)?.[0]?.toLowerCase();
-  const windows = [
+  return [
     { percent: quota?.fiveHourPercent, resetAt: quota?.fiveHourResetAt },
     { percent: quota?.weeklyPercent, resetAt: quota?.weeklyResetAt },
     ...(quota?.customWindows ?? []).filter(w => w.scope !== "model" || !family || w.label.toLowerCase() === family),
   ];
-  const exhausted = windows.filter(w => finite(w.percent) && w.percent >= 100 && (!finite(w.resetAt) || w.resetAt > now));
+}
+function full(w: { percent?: number }): boolean { return finite(w.percent) && w.percent >= 100; }
+function admission(snapshot: Snapshot, model: string, now: number): ClaudeAdmission {
+  const quota = snapshot.quota;
+  const exhausted = applicableWindows(quota, model).filter(w => full(w) && (!finite(w.resetAt) || w.resetAt > now));
   if (finite(snapshot.refusalUntil) && snapshot.refusalUntil > now) exhausted.push({ percent: 100, resetAt: snapshot.refusalUntil });
   if (exhausted.length) {
     const resets = exhausted.map(w => w.resetAt).filter(finite);
@@ -101,11 +105,9 @@ export async function checkClaudeUsageAdmission(model = "", deps: AdmissionDeps 
   if (cached?.identity === identity.key) {
     const status = admission(cached, model, now);
     if (status.state === "exhausted" && status.resetAt! > now) return status;
-    const expiredReset = [cached.refusalUntil,
-      ...(cached.quota?.fiveHourPercent === 100 ? [cached.quota.fiveHourResetAt] : []),
-      ...(cached.quota?.weeklyPercent === 100 ? [cached.quota.weeklyResetAt] : []),
-      ...(cached.quota?.customWindows ?? []).filter(w => w.percent === 100).map(w => w.resetAt),
-    ].some(reset => finite(reset) && reset <= now);
+    // Same windows and threshold as admission(): only a full window in scope for this model forces a re-read.
+    const expiredReset = [cached.refusalUntil, ...applicableWindows(cached.quota, model).filter(full).map(w => w.resetAt)]
+      .some(reset => finite(reset) && reset <= now);
     if (!expiredReset && now >= cached.checkedAt && now - cached.checkedAt < CACHE_MS) return status;
   }
   const requestKey = `${path}:${identity.key}`;
@@ -128,6 +130,14 @@ export async function checkClaudeUsageAdmission(model = "", deps: AdmissionDeps 
 }
 
 /** Parse Claude's explicit next-clock reset, including its IANA timezone. */
+let preflightOverride: ((model: string) => Promise<ClaudeAdmission>) | undefined;
+/** Test seam for the pre-dispatch check in the Responses executor; call with no argument to restore. */
+export function setClaudeUsagePreflightForTests(fn?: (model: string) => Promise<ClaudeAdmission>): void { preflightOverride = fn; }
+/** The pre-dispatch check the Responses executor runs before a claude-cli turn. */
+export function claudeUsagePreflight(model: string): Promise<ClaudeAdmission> {
+  return (preflightOverride ?? checkClaudeUsageAdmission)(model);
+}
+
 export function parseClaudeReset(message: string, now = Date.now()): number | undefined {
   if (!/hit.*limit|usage limit|rate limit/i.test(message)) return;
   const match = /resets?\s+(\d{1,2}):(\d{2})\s*(am|pm)\s*\(([^)]+)\)/i.exec(message);

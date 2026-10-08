@@ -10,7 +10,7 @@ import {
   buildArgs,
   buildChildEnv,
   CLAUDE_CLI_QUIET_ENV,
-  createClaudeCliAdapter,
+  createClaudeCliAdapter as createRealClaudeCliAdapter,
   findClaudeCliBinary,
   withClaudeLoginHint,
   type SpawnFn,
@@ -24,6 +24,10 @@ import { PROVIDER_REGISTRY } from "../../src/providers/registry";
 import { deriveProviderPresets, providerConfigSeed } from "../../src/providers/derive";
 import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig } from "../../src/types";
 import { createTestTranslatorBudget } from "../helpers/translator-budget";
+
+// Never run the real usage preflight here: it would read local Claude credentials and the shared quota cache.
+const createClaudeCliAdapter: typeof createRealClaudeCliAdapter = (provider, deps = {}) =>
+  createRealClaudeCliAdapter(provider, { usageAdmission: async () => ({ state: "available", checkedAt: 0 }), usageRefusal: () => {}, ...deps });
 
 const enc = new TextEncoder();
 
