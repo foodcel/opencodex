@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkClaudeUsageAdmission } from "../../src/adapters/claude-cli/usage-admission";
+import { checkClaudeUsageAdmission, formatClaudeReset } from "../../src/adapters/claude-cli/usage-admission";
 import { buildConversationInput, buildSystemPrompt, mapStreamMessageToEvents, usageFromResult } from "../../src/adapters/coding-agent/protocol";
 import { buildCodeBuddyToolBridge } from "../../src/adapters/codebuddy/tool-bridge";
 import { buildStableClaudeConversationInput, canonicalClaudeJson, CLAUDE_REPLAY_SYSTEM_PROMPT, stableClaudeToolBridge } from "../../src/adapters/claude-cli/stable-replay";
@@ -191,6 +191,19 @@ describe("Claude usage admission cache", () => {
       const status = await checkClaudeUsageAdmission("claude-sonnet-5-5", { now: () => now, identity, probe: async () => { probes++; return freshQuota; }, statePath });
       expect(status.state).toBe("available");
       expect(probes).toBe(1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  test("the exhausted message names the reset in the host time zone, not a fixed one", async () => {
+    const now = Date.now();
+    const resetAt = now + 2 * 3_600_000;
+    const { dir, statePath } = seed({ ...freshQuota, weeklyPercent: 100, weeklyResetAt: resetAt }, now);
+    try {
+      const status = await checkClaudeUsageAdmission("claude-sonnet-5-5", { now: () => now, identity, probe: async () => null, statePath });
+      expect(status.state).toBe("exhausted");
+      expect(status.resetAt).toBe(resetAt);
+      expect(status.message).toContain(`paused until ${formatClaudeReset(resetAt)},`);
+      expect(status.message).not.toContain("America/New_York");
+      expect(formatClaudeReset(Date.UTC(2026, 9, 8, 15, 30), "UTC")).toBe("Oct 8, 3:30 PM UTC");
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

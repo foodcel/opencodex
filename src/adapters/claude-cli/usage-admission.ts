@@ -78,6 +78,12 @@ function applicableWindows(quota: ProviderQuota | undefined, model: string): { p
     ...(quota?.customWindows ?? []).filter(w => w.scope !== "model" || !family || w.label.toLowerCase() === family),
   ];
 }
+/** A reset time in the proxy host's own time zone (or the given one), with the zone named. */
+export function formatClaudeReset(resetAt: number, timeZone?: string): string {
+  return new Intl.DateTimeFormat("en-US", {
+    ...(timeZone ? { timeZone } : {}), month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short",
+  }).format(resetAt);
+}
 function full(w: { percent?: number }): boolean { return finite(w.percent) && w.percent >= 100; }
 function admission(snapshot: Snapshot, model: string, now: number): ClaudeAdmission {
   const quota = snapshot.quota;
@@ -87,8 +93,7 @@ function admission(snapshot: Snapshot, model: string, now: number): ClaudeAdmiss
     const resets = exhausted.map(w => w.resetAt).filter(finite);
     // Unknown reset windows require another read after the short cache, not an invented reset date.
     const resetAt = resets.length === exhausted.length ? Math.max(...resets) : Math.max(snapshot.checkedAt + CACHE_MS, ...resets);
-    const reset = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(resetAt);
-    return { state: "exhausted", checkedAt: snapshot.checkedAt, resetAt, message: `Claude subscription limits are exhausted. Claude launches are paused until ${reset} (America/New_York), then usage will be checked again.` };
+    return { state: "exhausted", checkedAt: snapshot.checkedAt, resetAt, message: `Claude subscription limits are exhausted. Claude launches are paused until ${formatClaudeReset(resetAt)}, then usage will be checked again.` };
   }
   return { state: quota ? "available" : "unknown", checkedAt: snapshot.checkedAt };
 }
