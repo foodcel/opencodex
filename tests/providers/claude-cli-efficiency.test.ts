@@ -203,7 +203,9 @@ describe("Claude usage admission cache", () => {
       expect(status.resetAt).toBe(resetAt);
       expect(status.message).toContain(`paused until ${formatClaudeReset(resetAt)},`);
       expect(status.message).not.toContain("America/New_York");
-      expect(formatClaudeReset(Date.UTC(2026, 9, 8, 15, 30), "UTC")).toBe("Oct 8, 3:30 PM UTC");
+      // ICU versions differ in spacing (e.g. a narrow no-break space before "PM"): compare the words.
+      const utc = formatClaudeReset(Date.UTC(2026, 9, 8, 15, 30), "UTC").replace(/[\s,]+/g, " ").trim();
+      expect(utc).toMatch(/^Oct 8 3:30 PM (UTC|GMT)$/);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
