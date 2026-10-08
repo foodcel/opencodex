@@ -1,6 +1,6 @@
 import type { OcxConfig } from "../types";
+import { slugEquals } from "../providers/slug-codec";
 import { catalogModelSlug, type CatalogModel } from "./catalog";
-import { filterCatalogVisibleModels } from "./catalog/model-visibility";
 
 /**
  * The models a subagent can be pinned to: enabled native slugs first, then visible routed
@@ -13,14 +13,16 @@ import { filterCatalogVisibleModels } from "./catalog/model-visibility";
  * list missing that slot would silently truncate the persisted roster.
  */
 export function subagentSelectableModels(
-  config: Pick<OcxConfig, "disabledModels" | "subagentModels"> & Partial<Pick<OcxConfig, "providers">>,
+  config: Pick<OcxConfig, "disabledModels" | "subagentModels">,
   models: readonly CatalogModel[],
   nativeSlugs: readonly string[],
 ): string[] {
   const disabled = new Set(config.disabledModels ?? []);
-  const visibleRouted = [...new Set(filterCatalogVisibleModels([...models], {
-    disabledModels: config.disabledModels, providers: config.providers ?? {},
-  }).map(catalogModelSlug))];
+  const visibleRouted = [...new Set(models
+    .filter(m => ![...disabled].some(stored =>
+      stored === catalogModelSlug(m) || slugEquals(stored, m.provider, m.id)
+    ))
+    .map(catalogModelSlug))];
   const selectable = [...nativeSlugs.filter(ns => !disabled.has(ns)), ...visibleRouted];
   const selectableSet = new Set(selectable);
   return [
